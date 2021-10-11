@@ -28,10 +28,10 @@ class Informer(nn.Module):
         out_len,                    # output length
         factor=5,                   # Probsparse attn factor (defaults to 5)
         d_model=512,                # Dimension of model (defaults to 512)
-        n_heads=8,                  # Num of heads (defaults to 8)
-        e_layers=3,                 # Num of encoder layers (defaults to 3)
-        d_layers=2,                 # Num of decoder layers (defaults to 2)
-        d_ff=512,                   # Dimension of fcn (defaults to 2048)
+        nhead=8,                  # Num of heads (defaults to 8)
+        num_encoder_layers=3,                 # Num of encoder layers (defaults to 3)
+        num_decoder_layers=2,                 # Num of decoder layers (defaults to 2)
+        dim_feedforward=512,                   # Dimension of fcn (defaults to 2048)
         dropout=0.0,                # The probability of dropout (defaults to 0.0)
         attn="prob",                # Attention used in encoder (defaults to prob). This can be set to prob (informer), full (transformer)
         embed="fixed",              # Time features encoding (defaults to timeF). This can be set to timeF, fixed, learned
@@ -42,7 +42,7 @@ class Informer(nn.Module):
         mix=True,                   # Whether to use mix attention in generative decoder, using this argument means not using mix attention (defaults to True)
     ):
         super(Informer, self).__init__()
-        self.pred_len = out_len
+        self.output_chunk_length = out_len
         self.attn = attn
         self.output_attention = output_attention
 
@@ -63,17 +63,17 @@ class Informer(nn.Module):
                             output_attention=output_attention,
                         ),
                         d_model,
-                        n_heads,
+                        nhead,
                         mix=False,
                     ),
                     d_model,
-                    d_ff,
+                    dim_feedforward,
                     dropout=dropout,
                     activation=activation,
                 )
-                for l in range(e_layers)
+                for l in range(num_encoder_layers)
             ],
-            [ConvLayer(d_model) for l in range(e_layers - 1)] if distil else None,
+            [ConvLayer(d_model) for l in range(num_encoder_layers - 1)] if distil else None,
             norm_layer=torch.nn.LayerNorm(d_model),
         )
         # Decoder
@@ -88,7 +88,7 @@ class Informer(nn.Module):
                             output_attention=False,
                         ),
                         d_model,
-                        n_heads,
+                        nhead,
                         mix=mix,
                     ),
                     AttentionLayer(
@@ -99,15 +99,15 @@ class Informer(nn.Module):
                             output_attention=False,
                         ),
                         d_model,
-                        n_heads,
+                        nhead,
                         mix=False,
                     ),
                     d_model,
-                    d_ff,
+                    dim_feedforward,
                     dropout=dropout,
                     activation=activation,
                 )
-                for l in range(d_layers)
+                for l in range(num_decoder_layers)
             ],
             norm_layer=torch.nn.LayerNorm(d_model),
         )
@@ -137,75 +137,185 @@ class Informer(nn.Module):
         # dec_out = self.end_conv1(dec_out)
         # dec_out = self.end_conv2(dec_out.transpose(2,1)).transpose(1,2)
         if self.output_attention:
-            return dec_out[:, -self.pred_len :, :], attns
+            return dec_out[:, -self.output_chunk_length :, :], attns
         else:
-            return dec_out[:, -self.pred_len :, :]  # [B, L, D]
+            return dec_out[:, -self.output_chunk_length :, :]  # [B, L, D]
+
+class InformerStack(nn.Module):
+    def __init__(self, enc_in, dec_in, c_out, input_chunk_length, label_len, out_len, 
+                factor=5, d_model=512, nhead=8, num_encoder_layers=[3,2,1], num_decoder_layers=2, dim_feedforward=512, 
+                dropout=0.0, attn='prob', embed='fixed', freq='h', activation='gelu',
+                output_attention = False, distil=True, mix=True):
+        super(InformerStack, self).__init__()
+        self.output_chunk_length = out_len
+        self.attn = attn
+        self.output_attention = output_attention
+
+        # Encoding
+        self.enc_embedding = DataEmbedding(enc_in, d_model, embed, freq, dropout)
+        self.dec_embedding = DataEmbedding(dec_in, d_model, embed, freq, dropout)
+        # Attention
+        Attn = ProbAttention if attn=='prob' else FullAttention
+        # Encoder
+
+        inp_lens = list(range(len(num_encoder_layers))) # [0,1,2,...] you can customize here
+        encoders = [
+            Encoder(
+                [
+                    EncoderLayer(
+                        AttentionLayer(Attn(False, factor, attention_dropout=dropout, output_attention=output_attention), 
+                                    d_model, nhead, mix=False),
+                        d_model,
+                        dim_feedforward,
+                        dropout=dropout,
+                        activation=activation
+                    ) for l in range(el)
+                ],
+                [
+                    ConvLayer(
+                        d_model
+                    ) for l in range(el-1)
+                ] if distil else None,
+                norm_layer=torch.nn.LayerNorm(d_model)
+            ) for el in num_encoder_layers]
+        self.encoder = EncoderStack(encoders, inp_lens)
+        # Decoder
+        self.decoder = Decoder(
+            [
+                DecoderLayer(
+                    AttentionLayer(Attn(True, factor, attention_dropout=dropout, output_attention=False), 
+                                d_model, nhead, mix=mix),
+                    AttentionLayer(FullAttention(False, factor, attention_dropout=dropout, output_attention=False), 
+                                d_model, nhead, mix=False),
+                    d_model,
+                    dim_feedforward,
+                    dropout=dropout,
+                    activation=activation,
+                )
+                for l in range(num_decoder_layers)
+            ],
+            norm_layer=torch.nn.LayerNorm(d_model)
+        )
+        # self.end_conv1 = nn.Conv1d(in_channels=label_len+out_len, out_channels=out_len, kernel_size=1, bias=True)
+        # self.end_conv2 = nn.Conv1d(in_channels=d_model, out_channels=c_out, kernel_size=1, bias=True)
+        self.projection = nn.Linear(d_model, c_out, bias=True)
+        
+    def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, 
+                enc_self_mask=None, dec_self_mask=None, dec_enc_mask=None):
+        enc_out = self.enc_embedding(x_enc, x_mark_enc)
+        enc_out, attns = self.encoder(enc_out, attn_mask=enc_self_mask)
+
+        dec_out = self.dec_embedding(x_dec, x_mark_dec)
+        dec_out = self.decoder(dec_out, enc_out, x_mask=dec_self_mask, cross_mask=dec_enc_mask)
+        dec_out = self.projection(dec_out)
+        
+        # dec_out = self.end_conv1(dec_out)
+        # dec_out = self.end_conv2(dec_out.transpose(2,1)).transpose(1,2)
+        if self.output_attention:
+            return dec_out[:,-self.output_chunk_length:,:], attns
+        else:
+            return dec_out[:,-self.output_chunk_length:,:] # [B, L, D]
 
 class _InformerModule(nn.Module):
     def __init__(self,
-                 input_chunk_length: int,
-                 output_chunk_length: int,
-                 input_size: int,
-                 output_size: int,
-                 d_model: int,
-                 nhead: int,
-                 num_encoder_layers: int,
-                 num_decoder_layers: int,
-                 dim_feedforward: int,
-                 dropout: float,
-                 activation: str,
-                 custom_encoder: Optional[nn.Module] = None,
-                 custom_decoder: Optional[nn.Module] = None,
+                input_chunk_length: int=96, # Input sequence length of Informer encoder ; seq_len in native Informer
+                output_chunk_length:int=24, #	Prediction sequence length; pred_len in native Informer
+                label_len:int=48, # Start token length of Informer decoder
+                model:str = "informer",  # name of model used in Informer. informer or informerstack
+                num_encoder_layers:int = 2,     # number of encoder layers; `e_layers` in native Informer
+                num_decoder_layers:int =1,       # num of decoder layers; `d_layers` in native Informer
+                s_layers:str ='3,2,1', # num of stack encoder layers
+                enc_in:int=7,         # Encoder input size
+                dec_in:int=7,           # Decoder input size
+                c_out:int=7,	# Output size
+                factor:int=5, # Probsparse attn factor 
+                d_model:int=512, #	Dimension of model
+                nhead:int=8, # Number of heads in multi-head attention
+                dim_feedforward:int=2048, #	Dimension of fcn; `d_ff` in  native Informer
+                dropout:float=0.05,	# The probability of dropout
+                attn:str = "prob",	# Attention used in encoder. This can be set to `prob` (informer), `full` (transformer)
+                embed:str = "timeF", # Time features encoding (defaults to timeF). This can be set to `timeF`, `fixed`, `learned`
+                freq:str="h",# Freq for time features encoding. This can be set to s,t,h,d,b,w,m (s:secondly, t:minutely, h:hourly, d:daily, b:business days, w:weekly, m:monthly).You can also use more detailed freq like 15min or 3h
+                activation:str="gelu",	# Activation function
+                output_attention:bool=False, # Whether to output attention in encoder, using this argument means outputing attention
+                distil:bool=True, # Whether to use distilling in encoder, using this argument means not using distilling
+                mix:bool=True, # Whether to use mix attention in generative decoder, using this argument means not using mix attention
+                random_state: Optional[Union[int, RandomState]] = None,
                  ):
         super(_InformerModule, self).__init__()
+        self.model = model
+        self.num_encoder_layers = num_encoder_layers
+        self.num_decoder_layers = num_decoder_layers
+        self.s_layers = s_layers
+        self.enc_in = enc_in
+        self.dec_in = dec_in
+        self.c_out = c_out
+        self.input_chunk_length = input_chunk_length
+        self.label_len = label_len
+        self.output_chunk_length = output_chunk_length
+        self.factor = factor
+        self.d_model=d_model
+        self.nhead = nhead
+        self.dim_feedforward = dim_feedforward
+        self.dropout = dropout
+        self.attn = attn
+        self.embed = embed
+        self.freq = freq
+        self.activation = activation
+        self.output_attention = output_attention
+        self.distil = distil
+        self.mix = mix
 
-        self.input_size = input_size
-        self.target_size = output_size
-        self.target_length = output_chunk_length
+    def _build_model(self):
+        model_dict = {
+            'informer':Informer,
+            'informerstack':InformerStack,
+        }
+        if self.model=='informer' or self.model=='informerstack':
+            num_encoder_layers = self.num_encoder_layers if self.model=='informer' else self.s_layers
+            model = model_dict[self.model](
+                self.enc_in,
+                self.dec_in, 
+                self.c_out, 
+                self.input_chunk_length, 
+                self.label_len,
+                self.output_chunk_length, 
+                self.factor,
+                self.d_model, 
+                self.nhead, 
+                num_encoder_layers, 
+                self.num_decoder_layers, 
+                self.dim_feedforward,
+                self.dropout, 
+                self.attn,
+                self.embed,
+                self.freq,
+                self.activation,
+                self.output_attention,
+                self.distil,
+                self.mix,
+            )
 
-        self.encoder = nn.Linear(input_size, d_model)
-        self.positional_encoding = _PositionalEncoding(d_model, dropout, input_chunk_length)
+        return model
 
-        # Defining the Transformer module
-        self.transformer = nn.Transformer(d_model=d_model,
-                                          nhead=nhead,
-                                          num_encoder_layers=num_encoder_layers,
-                                          num_decoder_layers=num_decoder_layers,
-                                          dim_feedforward=dim_feedforward,
-                                          dropout=dropout,
-                                          activation=activation,
-                                          custom_encoder=custom_encoder,
-                                          custom_decoder=custom_decoder)
+    # def _create_transformer_inputs(self, data):
+    #     # '_TimeSeriesSequentialDataset' stores time series in the
+    #     # (batch_size, input_chunk_length, input_size) format. PyTorch's nn.Transformer
+    #     # module needs it the (input_chunk_length, batch_size, input_size) format.
+    #     # Therefore, the first two dimensions need to be swapped.
+        
+    #     # informmer do not need premute
+        
+    #     # src = data.permute(1, 0, 2)
+    #     tgt = data[-1:, :, :] 
 
-        self.decoder = nn.Linear(d_model, output_chunk_length * output_size)
-
-    def _create_transformer_inputs(self, data):
-        # '_TimeSeriesSequentialDataset' stores time series in the
-        # (batch_size, input_chunk_length, input_size) format. PyTorch's nn.Transformer
-        # module needs it the (input_chunk_length, batch_size, input_size) format.
-        # Therefore, the first two dimensions need to be swapped.
-        src = data.permute(1, 0, 2)
-        tgt = src[-1:, :, :]
-
-        return src, tgt
+    #     return data, tgt
 
     def forward(self, data):
-        # Here we create 'src' and 'tgt', the inputs for the encoder and decoder
-        # side of the Transformer architecture
-        src, tgt = self._create_transformer_inputs(data)
-        print(f"src.shape={src.shape}, tgt.shape={tgt.shape}")
-        # "math.sqrt(self.input_size)" is a normalization factor
-        # see section 3.2.1 in 'Attention is All you Need' by Vaswani et al. (2017)
-        src = self.encoder(src) * math.sqrt(self.input_size)
-        src = self.positional_encoding(src)
 
-        tgt = self.encoder(tgt) * math.sqrt(self.input_size)
-        tgt = self.positional_encoding(tgt)
-
-        x = self.transformer(src=src,
-                             tgt=tgt)
-        out = self.decoder(x)
-
+        informer_model = self._build_model()
+        out = informer_model(data)
+        print(out.shape)
         # Here we change the data format
         # from (1, batch_size, output_chunk_length * output_size)
         # to (batch_size, output_chunk_length, output_size)
@@ -216,55 +326,91 @@ class _InformerModule(nn.Module):
 class InformerModel(PastCovariatesTorchModel):
     @random_method
     def __init__(self,
-                 input_chunk_length: int,
-                 output_chunk_length: int,
-                 d_model: int = 64,
-                 nhead: int = 4,
-                 num_encoder_layers: int = 3,
-                 num_decoder_layers: int = 3,
-                 dim_feedforward: int = 512,
-                 dropout: float = 0.1,
-                 activation: str = "relu",
-                 custom_encoder: Optional[nn.Module] = None,
-                 custom_decoder: Optional[nn.Module] = None,
-                 random_state: Optional[Union[int, RandomState]] = None,
-                 **kwargs):
-
+                model:str = "informer",  # name of model used in Informer. informer or informerstack
+                num_encoder_layers:int = 2,     # number of encoder layers; `e_layers` in native Informer
+                num_decoder_layers:int =1,       # num of decoder layers; `d_layers` in native Informer
+                s_layers:str ='3,2,1', # num of stack encoder layers
+                enc_in:int=7,         # Encoder input size
+                dec_in:int=7,           # Decoder input size
+                c_out:int=7,	# Output size
+                input_chunk_length: int=96, # Input sequence length of Informer encoder ; seq_len in native Informer
+                label_len:int=48, # Start token length of Informer decoder
+                output_chunk_length:int=24, #	Prediction sequence length; pred_len in native Informer
+                factor:int=5, # Probsparse attn factor 
+                d_model:int=512, #	Dimension of model
+                nhead:int=8, # Number of heads in multi-head attention
+                dim_feedforward:int=2048, #	Dimension of fcn; `d_ff` in  native Informer
+                dropout:float=0.05,	# The probability of dropout
+                attn:str = "prob",	# Attention used in encoder. This can be set to `prob` (informer), `full` (transformer)
+                embed:str = "timeF", # Time features encoding (defaults to timeF). This can be set to `timeF`, `fixed`, `learned`
+                freq:str="h",# Freq for time features encoding. This can be set to s,t,h,d,b,w,m (s:secondly, t:minutely, h:hourly, d:daily, b:business days, w:weekly, m:monthly).You can also use more detailed freq like 15min or 3h
+                activation:str="gelu",	# Activation function
+                output_attention:bool=False, # Whether to output attention in encoder, using this argument means outputing attention
+                distil:bool=True, # Whether to use distilling in encoder, using this argument means not using distilling
+                mix:bool=True, # Whether to use mix attention in generative decoder, using this argument means not using mix attention
+                random_state: Optional[Union[int, RandomState]] = None,
+                **kwargs):
+    
         kwargs['input_chunk_length'] = input_chunk_length
         kwargs['output_chunk_length'] = output_chunk_length
         super().__init__(**kwargs)
-
-        self.input_chunk_length = input_chunk_length
-        self.output_chunk_length = output_chunk_length
-        self.d_model = d_model
-        self.nhead = nhead
+        self.model = model
         self.num_encoder_layers = num_encoder_layers
         self.num_decoder_layers = num_decoder_layers
+        self.s_layers = s_layers
+        self.enc_in = enc_in
+        self.dec_in = dec_in
+        self.c_out = c_out
+        self.input_chunk_length = input_chunk_length
+        self.label_len = label_len
+        self.output_chunk_length = output_chunk_length
+        self.factor = factor
+        self.d_model=d_model
+        self.nhead = nhead
         self.dim_feedforward = dim_feedforward
         self.dropout = dropout
+        self.attn = attn
+        self.embed = embed
+        self.freq = freq
         self.activation = activation
-        self.custom_encoder = custom_encoder
-        self.custom_decoder = custom_decoder
-
+        self.output_attention = output_attention
+        self.distil = distil
+        self.mix = mix
+        self.random_state= random_state
+    
+    
     def _create_model(self, train_sample: Tuple[torch.Tensor]) -> torch.nn.Module:
         # samples are made of (past_target, past_covariates, future_target)
+        print("train_sample")
+        print(train_sample)
+        
         input_dim = train_sample[0].shape[1] + (train_sample[1].shape[1] if train_sample[1] is not None else 0)
         output_dim = train_sample[-1].shape[1]
-
-        return _InformerModule(input_chunk_length=self.input_chunk_length,
-                                  output_chunk_length=self.output_chunk_length,
-                                  input_size=input_dim,
-                                  output_size=output_dim,
-                                  d_model=self.d_model,
-                                  nhead=self.nhead,
-                                  num_encoder_layers=self.num_encoder_layers,
-                                  num_decoder_layers=self.num_decoder_layers,
-                                  dim_feedforward=self.dim_feedforward,
-                                  dropout=self.dropout,
-                                  activation=self.activation,
-                                  custom_encoder=self.custom_encoder,
-                                  custom_decoder=self.custom_decoder)
         
+        print(f"input_dim={input_dim},output_dim={output_dim}")
         
-if __name__ == "__main__":
-    
+        return _InformerModule(
+                input_chunk_length=self.input_chunk_length, 
+                output_chunk_length=self.output_chunk_length,
+                label_len=self.label_len,
+                model= self.model,  
+                num_encoder_layers=self.num_encoder_layers,
+                num_decoder_layers=self.num_decoder_layers, 
+                s_layers=self.s_layers, 
+                enc_in=self.enc_in, 
+                dec_in=self.dec_in, 
+                c_out=self.c_out, 
+                factor=self.factor, 
+                d_model=self.d_model, 
+                nhead=self.nhead, 
+                dim_feedforward=self.dim_feedforward, 
+                dropout=self.dropout, 
+                attn=self.attn, 
+                embed=self.embed, 
+                freq=self.freq, 
+                activation=self.activation, 
+                output_attention=self.output_attention, 
+                distil=self.distil, 
+                mix=self.mix, 
+                random_state=self.random_state, 
+        )
