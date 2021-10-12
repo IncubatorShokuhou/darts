@@ -240,7 +240,7 @@ class RNNModel(TorchParametricProbabilisticForecastingModel, DualCovariatesTorch
                                             hidden_dim=self.hidden_dim,
                                             dropout=self.dropout,
                                             num_layers=self.n_rnn_layers)
-        return model
+        return model 
 
     def _build_train_dataset(self,
                              target: Sequence[TimeSeries],

@@ -12,7 +12,7 @@ from typing import Optional, Union, Tuple
 from ..utils.torch import random_method
 from ..logging import get_logger
 from .torch_forecasting_model import PastCovariatesTorchModel
-
+from loguru import logger as loguru_logger
 logger = get_logger(__name__)
 
 
@@ -313,9 +313,11 @@ class TransformerModel(PastCovariatesTorchModel):
 
     def _create_model(self, train_sample: Tuple[torch.Tensor]) -> torch.nn.Module:
         # samples are made of (past_target, past_covariates, future_target)
+       
         input_dim = train_sample[0].shape[1] + (train_sample[1].shape[1] if train_sample[1] is not None else 0)
         output_dim = train_sample[-1].shape[1]
-
+        
+        loguru_logger.debug(f"input_dim={input_dim},output_dim={output_dim}")
         return _TransformerModule(input_chunk_length=self.input_chunk_length,
                                   output_chunk_length=self.output_chunk_length,
                                   input_size=input_dim,

@@ -356,7 +356,7 @@ def datetime_attribute_timeseries(time_index: Union[pd.DatetimeIndex, TimeSeries
         'day': 31,
         'weekday': 7,
         'hour': 24,
-        'quarter': 4
+        'quarter': 4,
     }
 
     values = getattr(time_index, attribute)

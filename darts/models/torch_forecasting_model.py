@@ -62,7 +62,7 @@ DEFAULT_DARTS_FOLDER = '.darts'
 CHECKPOINTS_FOLDER = 'checkpoints'
 RUNS_FOLDER = 'runs'
 UNTRAINED_MODELS_FOLDER = 'untrained_models'
-
+from loguru import logger as loguru_logger
 logger = get_logger(__name__)
 
 
@@ -248,10 +248,12 @@ class TorchForecastingModel(GlobalForecastingModel, ABC):
 
         if np.issubdtype(self.train_sample[0].dtype, np.float32):
             logger.info('Time series values are 32-bits; casting model to float32.')
+            loguru_logger.info('Time series values are 32-bits; casting model to float32.')
             self.model = model.float()
         elif np.issubdtype(self.train_sample[0].dtype, np.float64):
             logger.info('Time series values are 64-bits; casting model to float64. If training is too slow you '
                         'can try casting your data to 32-bits.')
+            loguru_logger.info('Time series values are 64-bits; casting model to float64. If training is too slow you can try casting your data to 32-bits.')
             self.model = model.double()
 
         self.model = self.model.to(self.device)
@@ -259,6 +261,7 @@ class TorchForecastingModel(GlobalForecastingModel, ABC):
         # A utility function to create optimizer and lr scheduler from desired classes
         def _create_from_cls_and_kwargs(cls, kws):
             try:
+                loguru_logger.debug(f"Creating class:{cls.__name__},{cls} with kwargs: {kws}")
                 return cls(**kws)
             except (TypeError, ValueError) as e:
                 raise_log(ValueError('Error when building the optimizer or learning rate scheduler;'
@@ -427,7 +430,7 @@ class TorchForecastingModel(GlobalForecastingModel, ABC):
         val_dataset = self._build_train_dataset(val_series, val_past_covariates, future_covariates) if val_series is not None else None
 
         logger.info('Train dataset contains {} samples.'.format(len(train_dataset)))
-
+        loguru_logger.info('Train dataset contains {} samples.'.format(len(train_dataset)))
         self.fit_from_dataset(train_dataset, val_dataset, verbose, epochs)
 
     @random_method
