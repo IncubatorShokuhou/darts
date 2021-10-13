@@ -233,6 +233,12 @@ class BlockRNNModel(TorchParametricProbabilisticForecastingModel, PastCovariates
         input_dim = train_sample[0].shape[1] + (train_sample[1].shape[1] if train_sample[1] is not None else 0)
         output_dim = train_sample[-1].shape[1]
 
+        from loguru import logger as loguru_logger
+        loguru_logger.info(f"train_sample[0].shape={train_sample[0].shape}") # (30,2)
+        loguru_logger.info(f"train_sample[1].shape={train_sample[1].shape}") # (30,1)
+        loguru_logger.info(f"train_sample[2].shape={train_sample[2].shape}") # (10,2)
+        
+        
         target_size = (
             self.likelihood.num_parameters * output_dim if self.likelihood is not None else output_dim
         )

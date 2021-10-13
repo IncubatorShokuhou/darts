@@ -319,18 +319,20 @@ class TransformerModel(TorchParametricProbabilisticForecastingModel, PastCovaria
 
     def _create_model(self, train_sample: Tuple[torch.Tensor]) -> torch.nn.Module:
         # samples are made of (past_target, past_covariates, future_target)
-       
+        
+
         input_dim = train_sample[0].shape[1] + (train_sample[1].shape[1] if train_sample[1] is not None else 0)
         output_dim = train_sample[-1].shape[1]
-<<<<<<< HEAD:darts/models/transformer_model.py
-        
-        loguru_logger.debug(f"input_dim={input_dim},output_dim={output_dim}")
-=======
+
+        from loguru import logger as loguru_logger
+        loguru_logger.info(f"train_sample[0].shape={train_sample[0].shape}") # (30,2)
+        loguru_logger.info(f"train_sample[1].shape={train_sample[1].shape}") # (30,1)
+        loguru_logger.info(f"train_sample[2].shape={train_sample[2].shape}") # (10,2)
+
 
         target_size = (
             self.likelihood.num_parameters * output_dim if self.likelihood is not None else output_dim
         )
->>>>>>> 484a184a97be37e64ed62f6fa6fad2bdef898adf:darts/models/forecasting/transformer_model.py
         return _TransformerModule(input_chunk_length=self.input_chunk_length,
                                   output_chunk_length=self.output_chunk_length,
                                   input_size=input_dim,

@@ -4,7 +4,7 @@ Utils for time series generation
 """
 
 import math
-
+from datetime import datetime,timedelta
 from typing import Union, Optional
 
 import numpy as np
@@ -517,6 +517,39 @@ def datetime_attribute_timeseries(time_index: Union[pd.DatetimeIndex, TimeSeries
         else:
             values_df = pd.DataFrame({attribute: values})
 
+    values_df.index = time_index
+
+    return TimeSeries.from_dataframe(values_df)
+
+def timestamp_timeseries(time_index: Union[pd.DatetimeIndex, TimeSeries]) -> TimeSeries:
+    """
+    Returns a new TimeSeries with index `time_index` and one or more dimensions containing
+    (optionally one-hot encoded or cyclic encoded) pd.DatatimeIndex attribute information derived from the index.
+
+
+    Parameters
+    ----------
+    time_index
+        Either a `pd.DatetimeIndex` attribute which will serve as the basis of the new column(s), or
+        a `TimeSeries` whose time axis will serve this purpose.
+    Returns
+    -------
+    TimeSeries
+        New datetime attribute TimeSeries instance.
+    """
+
+    if isinstance(time_index, TimeSeries):
+        time_index = time_index.time_index
+
+    
+    
+    values = list(time_index.values)
+    
+    values = [(ivalue-np.datetime64(0,"s"))/np.timedelta64(1,"s")   for ivalue in values]
+    
+    
+    values_df = pd.DataFrame({"timestamp": values})
+    
     values_df.index = time_index
 
     return TimeSeries.from_dataframe(values_df)

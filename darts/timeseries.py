@@ -1595,7 +1595,7 @@ class TimeSeries:
                                                             times=idx,
                                                             fill_missing_dates=False))
 
-    def stack(self, other: 'TimeSeries') -> 'TimeSeries':
+    def stack(self, other: 'TimeSeries',inverse=False) -> 'TimeSeries':
         """
         Stacks another univariate or multivariate TimeSeries with the same time index on top of
         the current one (along the component axis), and returns the newly formed multivariate TimeSeries that includes
@@ -1626,9 +1626,10 @@ class TimeSeries:
                                         coords={self._time_dim: self._time_index, DIMS[1]: other.components})
         else:
             new_other_xa = other_xa
-
-        new_xa = xr.concat((self._xa, new_other_xa), dim=DIMS[1])
-
+        if not inverse:
+            new_xa = xr.concat((self._xa, new_other_xa), dim=DIMS[1])
+        else:
+            new_xa = xr.concat((new_other_xa, self._xa), dim=DIMS[1])
         # we call the factory method here to disambiguate column names if needed.
         return TimeSeries.from_xarray(new_xa, fill_missing_dates=False)
 
@@ -1681,6 +1682,24 @@ class TimeSeries:
         self._assert_deterministic()
         from .utils import timeseries_generation as tg
         return self.stack(tg.datetime_attribute_timeseries(self.time_index, attribute, one_hot, cyclic))
+
+    def add_timestamp(self) -> 'TimeSeries':
+        """
+        Returns a new TimeSeries instance with one additional componentthat contain
+        the time index of the current series.
+
+        Parameters
+        ----------
+
+        Returns
+        -------
+        TimeSeries
+            New TimeSeries instance enhanced by `attribute`.
+        """
+        self._assert_deterministic()
+        from .utils import timeseries_generation as tg
+        return self.stack(tg.timestamp_timeseries(self.time_index),inverse=True)
+
 
     def add_holidays(self,
                      country_code: str,

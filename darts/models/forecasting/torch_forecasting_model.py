@@ -184,7 +184,7 @@ class TorchForecastingModel(GlobalForecastingModel, ABC):
         # The tensorboard writer
         self.tb_writer = None
 
-        # Persist optimiser and LR scheduler parameters
+        # Persist optimizer and LR scheduler parameters
         self.optimizer_cls = optimizer_cls
         self.optimizer_kwargs = dict() if optimizer_kwargs is None else optimizer_kwargs
         self.lr_scheduler_cls = lr_scheduler_cls
@@ -430,7 +430,6 @@ class TorchForecastingModel(GlobalForecastingModel, ABC):
         val_dataset = self._build_train_dataset(val_series, val_past_covariates, future_covariates) if val_series is not None else None
 
         logger.info('Train dataset contains {} samples.'.format(len(train_dataset)))
-        loguru_logger.info('Train dataset contains {} samples.'.format(len(train_dataset)))
         self.fit_from_dataset(train_dataset, val_dataset, verbose, epochs)
 
     @random_method

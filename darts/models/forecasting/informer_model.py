@@ -3,21 +3,31 @@ Transformer Model
 -----------------
 """
 
+from datetime import datetime
 from typing import Optional, Tuple, Union
-import loguru
 
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
+from darts.logging import get_logger
+from darts.models.forecasting._informer_models.attn import (
+    AttentionLayer,
+    FullAttention,
+    ProbAttention,
+)
+from darts.models.forecasting._informer_models.decoder import Decoder, DecoderLayer
+from darts.models.forecasting._informer_models.embed import DataEmbedding
+from darts.models.forecasting._informer_models.encoder import (
+    ConvLayer,
+    Encoder,
+    EncoderLayer,
+    EncoderStack,
+)
+from darts.models.forecasting._informer_models.utils.timefeatures import time_features
+from darts.models.forecasting.torch_forecasting_model import PastCovariatesTorchModel
+from darts.utils.torch import random_method
 from numpy.random import RandomState
-
-from ..logging import get_logger
-from ..utils.torch import random_method
-from ._informer_models.attn import AttentionLayer, FullAttention, ProbAttention
-from ._informer_models.decoder import Decoder, DecoderLayer
-from ._informer_models.embed import DataEmbedding
-from ._informer_models.encoder import ConvLayer, Encoder, EncoderLayer, EncoderStack
-from .torch_forecasting_model import PastCovariatesTorchModel
-from loguru import logger as loguru_logger
 
 logger = get_logger(__name__)
 
@@ -132,11 +142,6 @@ class Informer(nn.Module):
         dec_self_mask=None,
         dec_enc_mask=None,
     ):
-        loguru_logger.debug(f"x_enc.shape={x_enc.shape}")
-        loguru_logger.debug(f"x_mark_enc={x_mark_enc.shape}")
-        loguru_logger.debug(f"x_dec.shape={x_dec.shape}")
-        loguru_logger.debug(f"x_mark_dec={x_mark_dec.shape}")
-        
 
         enc_out = self.enc_embedding(x_enc, x_mark_enc)
         enc_out, attns = self.encoder(enc_out, attn_mask=enc_self_mask)
@@ -293,14 +298,13 @@ class _InformerModule(nn.Module):
         self,
         input_chunk_length: int = 96,  # Input sequence length of Informer encoder ; seq_len in native Informer
         output_chunk_length: int = 24,  # 	Prediction sequence length; pred_len in native Informer
+        input_size: int = 7,  # Input size
+        output_size: int = 7,  # Output size
         label_len: int = 48,  # Start token length of Informer decoder
         model_name: str = "informer",  # name of model used in Informer. informer or informerstack
         num_encoder_layers: int = 2,  # number of encoder layers; `e_layers` in native Informer
         num_decoder_layers: int = 1,  # num of decoder layers; `d_layers` in native Informer
         s_layers: str = "3,2,1",  # num of stack encoder layers
-        enc_in: int = 7,  # Encoder input size
-        dec_in: int = 7,  # Decoder input size
-        output_size: int = 7,  # Output size
         factor: int = 5,  # Probsparse attn factor
         d_model: int = 512,  # 	Dimension of model
         nhead: int = 8,  # Number of heads in multi-head attention
@@ -313,6 +317,8 @@ class _InformerModule(nn.Module):
         output_attention: bool = False,  # Whether to output attention in encoder, using this argument means outputing attention
         distil: bool = True,  # Whether to use distilling in encoder, using this argument means not using distilling
         mix: bool = True,  # Whether to use mix attention in generative decoder, using this argument means not using mix attention
+        padding: int = 0,  # Padding for time features encoding. 0 or 1
+        device: torch.device = torch.device("cpu"),
         random_state: Optional[Union[int, RandomState]] = None,
     ):
         super(_InformerModule, self).__init__()
@@ -321,9 +327,10 @@ class _InformerModule(nn.Module):
         self.num_encoder_layers = num_encoder_layers
         self.num_decoder_layers = num_decoder_layers
         self.s_layers = s_layers
-        self.enc_in = enc_in
-        self.dec_in = dec_in
+        self.input_size = input_size
         self.output_size = output_size
+        self.enc_in = self.input_size
+        self.dec_in = self.input_size
         self.input_chunk_length = input_chunk_length
         self.label_len = label_len
         self.output_chunk_length = output_chunk_length
@@ -339,7 +346,10 @@ class _InformerModule(nn.Module):
         self.output_attention = output_attention
         self.distil = distil
         self.mix = mix
+        self.padding = padding
+        self.timeenc = 0 if self.embed != "timeF" else 1
         self.built_model = self._build_model()
+        self.device = device
 
     def _build_model(self):
         model_dict = {
@@ -374,47 +384,124 @@ class _InformerModule(nn.Module):
                 distil=self.distil,  # Whether to use distilling in encoder, using this argument means not using distilling (defaults to True)
                 mix=self.mix,
             )
+            return built_model
+        else:
+            raise ValueError("model_name must be `informer` or `informerstack`.")
 
-        return built_model
-
-    def _create_informer_inputs(self, data):
+    def _create_informer_inputs(self, data: torch.Tensor):
         # loguru_logger.info(f"data.shape: {data.shape}") #[32, 30, 2]
-        # x_enc.shape=torch.Size([32, 96, 7]), 
-        # x_mark_enc=torch.Size([32, 96, 4]), 
-        # x_dec.shape=torch.Size([32, 72, 7]), 
+        # x_enc.shape=torch.Size([32, 96, 7]),
+        # x_mark_enc=torch.Size([32, 96, 4]),
+        # x_dec.shape=torch.Size([32, 72, 7]),
         # x_mark_dec=torch.Size([32, 72, 4]),
-        
-        
-        x_enc,x_mark_enc,x_dec,x_mark_dec
-        
-        
-        
-        enc_self_mask=None, 
-        dec_self_mask=None,
-        dec_enc_mask=None
-        
-        return x_enc,x_mark_enc,x_dec,x_mark_dec,enc_self_mask,dec_self_mask,dec_enc_mask
+        # s_begin = index # 0
+        # s_end = s_begin + self.seq_len # 96
+        # r_begin = s_end - self.label_len  # 96-48=48
+        # r_end = r_begin + self.label_len + self.pred_len # 96+24
 
-    def forward(self,        data        ):
-        x_enc,x_mark_enc,x_dec,x_mark_dec,enc_self_mask,dec_self_mask,dec_enc_mask = self._create_informer_inputs(data)
-        out = self.built_model(x_enc,x_mark_enc,x_dec,x_mark_dec,enc_self_mask,dec_self_mask,dec_enc_mask)
-        loguru_logger.debug(f"{out.shape}")
+        data_x = data[:, :, 1:]
+        data_y = data[:, :, 1:]
 
-        return out
+        stamp = data[:, :, 0]
+        # generate more timestamps,till `len(data[0,:,0])+self.pred_len`
+        new_stamp = []
+        for i in range(stamp.shape[0]):
+            time_delta_float = (stamp[i, 1] - stamp[i, 0]).item()
+            # new_time_series = np.linspace(start=stamp[i,0], stop=stamp[i,0]+(self.input_chunk_length + self.output_chunk_length-1)*time_delta_float, num=self.input_chunk_length + self.output_chunk_length, endpoint=True)
+            new_time_series = torch.linspace(
+                start=stamp[i, 0].item(),
+                end=stamp[i, 0].item()
+                + (self.input_chunk_length + self.output_chunk_length - 1)
+                * time_delta_float,
+                steps=self.input_chunk_length + self.output_chunk_length,
+            )
+            new_stamp.append(list(new_time_series.numpy()))
+
+        new_datetime = [[datetime.fromtimestamp(j) for j in i] for i in new_stamp]
+
+        data_stamp = []
+        for i_batch in new_datetime:
+            i_time_features = time_features(
+                dates=pd.DataFrame(i_batch, columns=["date"]),
+                timeenc=self.timeenc,
+                freq=self.freq[-1:],
+            )
+            data_stamp.append(i_time_features)
+        data_stamp = np.array(data_stamp)
+        seq_x = data_x
+        seq_y = data_y
+        seq_x_mark = data_stamp[:, : self.input_chunk_length, :]
+        seq_y_mark = data_stamp[
+            :,
+            (self.input_chunk_length - self.label_len) : (
+                self.input_chunk_length + self.output_chunk_length
+            ),
+            :,
+        ]
+
+        batch_x, batch_y, batch_x_mark, batch_y_mark = (
+            seq_x,
+            seq_y,
+            seq_x_mark,
+            seq_y_mark,
+        )
+
+        # decoder input
+
+        if self.padding == 0:
+            dec_inp = torch.zeros(
+                [batch_y.shape[0], self.output_chunk_length, batch_y.shape[-1]]
+            ).to(self.device)
+        elif self.padding == 1:
+            dec_inp = torch.ones(
+                [batch_y.shape[0], self.output_chunk_length, batch_y.shape[-1]]
+            ).to(self.device)
+        else:
+            raise ValueError("padding must be 0 or 1")
+
+        dec_inp = torch.cat([batch_y[:, : self.label_len, :], dec_inp], dim=1)
+
+        return (
+            batch_x,
+            torch.from_numpy(batch_x_mark).to(self.device),
+            dec_inp,
+            torch.from_numpy(batch_y_mark).to(self.device),
+            None,
+            None,
+            None,
+        )
+
+    def forward(self, data):
+        (
+            x_enc,
+            x_mark_enc,
+            x_dec,
+            x_mark_dec,
+            enc_self_mask,
+            dec_self_mask,
+            dec_enc_mask,
+        ) = self._create_informer_inputs(data)
+        return self.built_model(
+            x_enc,
+            x_mark_enc,
+            x_dec,
+            x_mark_dec,
+            enc_self_mask,
+            dec_self_mask,
+            dec_enc_mask,
+        )
 
 
 class InformerModel(PastCovariatesTorchModel):
     @random_method
     def __init__(
         self,
-        input_chunk_length: int = 96,  # Input sequence length of Informer encoder ; seq_len in native Informer
-        output_chunk_length: int = 24,  # 	Prediction sequence length; pred_len in native Informer
+        input_chunk_length: int,  # Input sequence length of Informer encoder ; seq_len in native Informer
+        output_chunk_length: int,  # 	Prediction sequence length; pred_len in native Informer
         model_name: str = "informer",  # name of model used in Informer. informer or informerstack; `model` in native Informer. Cannot use `model` because `TorchForecastingModel` have attribute named `model`
         num_encoder_layers: int = 2,  # number of encoder layers; `e_layers` in native Informer
         num_decoder_layers: int = 1,  # num of decoder layers; `d_layers` in native Informer
         s_layers: str = "3,2,1",  # num of stack encoder layers
-        enc_in: int = 7,  # Encoder input size. maybe need to be same as train input dim.
-        dec_in: int = 7,  # Decoder input size
         output_size: int = 7,  # Output size
         label_len: int = 48,  # Start token length of Informer decoder
         factor: int = 5,  # Probsparse attn factor
@@ -429,6 +516,7 @@ class InformerModel(PastCovariatesTorchModel):
         output_attention: bool = False,  # Whether to output attention in encoder, using this argument means outputing attention
         distil: bool = True,  # Whether to use distilling in encoder, using this argument means not using distilling
         mix: bool = True,  # Whether to use mix attention in generative decoder, using this argument means not using mix attention
+        padding: int = 0,  # Padding type
         random_state: Optional[Union[int, RandomState]] = None,
         **kwargs,
     ):
@@ -443,8 +531,6 @@ class InformerModel(PastCovariatesTorchModel):
         self.num_encoder_layers = num_encoder_layers
         self.num_decoder_layers = num_decoder_layers
         self.s_layers = s_layers
-        self.enc_in = enc_in
-        self.dec_in = dec_in
         self.output_size = output_size
         self.label_len = label_len
         self.factor = factor
@@ -459,29 +545,39 @@ class InformerModel(PastCovariatesTorchModel):
         self.output_attention = output_attention
         self.distil = distil
         self.mix = mix
+        self.padding = padding
         self.random_state = random_state
 
     def _create_model(self, train_sample: Tuple[torch.Tensor]) -> torch.nn.Module:
         # samples are made of (past_target, past_covariates, future_target)
 
-        input_dim = train_sample[0].shape[1] + (
-            train_sample[1].shape[1] if train_sample[1] is not None else 0
-        )
+        # delete timestamp dimension in train_sample 0 and 2
+        # train_sample[0] = train_sample[0][:,1:]
+        train_sample_2 = train_sample[2][:, 1:]
+        train_sample = tuple([i for i in train_sample[:-1]] + [train_sample_2])
+
+        input_dim = (
+            train_sample[0].shape[1]
+            + (train_sample[1].shape[1] if train_sample[1] is not None else 0)
+            - 1
+        )  # here minus 1 because there is one more line of timestamps in train_sample[0]
         output_dim = train_sample[-1].shape[1]
 
-        print(f"input_dim={input_dim},output_dim={output_dim}")
+        # print(f"train_sample[0].shape={train_sample[0].shape}") # (30,2)
+        # print(f"train_sample[1].shape={train_sample[1].shape}") # (30,1)
+        # print(f"train_sample[2].shape={train_sample[2].shape}") # (10,2)
+        # print(f"train_sample[2]={train_sample[2]}")
 
         return _InformerModule(
             input_chunk_length=self.input_chunk_length,
             output_chunk_length=self.output_chunk_length,
+            input_size=input_dim,
+            output_size=output_dim,
             label_len=self.label_len,
             model_name=self.model_name,
             num_encoder_layers=self.num_encoder_layers,
             num_decoder_layers=self.num_decoder_layers,
             s_layers=self.s_layers,
-            enc_in=self.enc_in,
-            dec_in=self.dec_in,
-            output_size=self.output_size,
             factor=self.factor,
             d_model=self.d_model,
             nhead=self.nhead,
@@ -494,5 +590,7 @@ class InformerModel(PastCovariatesTorchModel):
             output_attention=self.output_attention,
             distil=self.distil,
             mix=self.mix,
+            padding=self.padding,
+            device=self.device,
             random_state=self.random_state,
         )
